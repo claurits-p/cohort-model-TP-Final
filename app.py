@@ -48,6 +48,7 @@ from ui.cohort_engine import run_cohort_comparison
 from ui.cohort_display import (
     render_volume_forecast,
     render_summary_metrics,
+    render_annualized_impact,
     render_scenario_header,
     render_side_by_side_tables,
     render_delta_table,
@@ -145,6 +146,9 @@ def main():
 
         st.divider()
         render_summary_metrics(standard, ltv, topline)
+
+        st.divider()
+        render_annualized_impact(standard, ltv, topline)
 
         st.divider()
         render_break_even_chart(standard, ltv, topline)

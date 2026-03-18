@@ -339,6 +339,70 @@ def render_pricing_comparison(
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
+def render_annualized_impact(
+    std: CohortScenario, ltv: CohortScenario, top: CohortScenario,
+) -> None:
+    """Staggered multi-cohort impact: 4 quarterly cohorts over a 3-year window.
+
+    Q1 cohort gets full Y1+Y2+Y3; Q2 gets Y1+Y2+75% Y3; Q3 gets Y1+Y2+50% Y3;
+    Q4 gets Y1+Y2+25% Y3.  Shows the incremental difference vs Standard for
+    Revenue, Margin, and Margin %.
+    """
+    st.markdown("**Annualized Cohort Impact** *(4 quarterly cohorts, staggered 3-year window)*")
+
+    y3_weights = [1.0, 0.75, 0.50, 0.25]
+
+    def _staggered_totals(scenario: CohortScenario) -> tuple[float, float]:
+        y1_rev = scenario.cohort_yearly[1].total_revenue
+        y2_rev = scenario.cohort_yearly[2].total_revenue
+        y3_rev = scenario.cohort_yearly[3].total_revenue
+        y1_cost = scenario.cohort_yearly[1].total_cost
+        y2_cost = scenario.cohort_yearly[2].total_cost
+        y3_cost = scenario.cohort_yearly[3].total_cost
+
+        total_rev = 0.0
+        total_cost = 0.0
+        for w in y3_weights:
+            total_rev += y1_rev + y2_rev + y3_rev * w
+            total_cost += y1_cost + y2_cost + y3_cost * w
+        return total_rev, total_cost
+
+    std_rev, std_cost = _staggered_totals(std)
+    ltv_rev, ltv_cost = _staggered_totals(ltv)
+    top_rev, top_cost = _staggered_totals(top)
+
+    std_margin = std_rev - std_cost
+    ltv_margin = ltv_rev - ltv_cost
+    top_margin = top_rev - top_cost
+
+    std_mpct = std_margin / std_rev if std_rev > 0 else 0
+    ltv_mpct = ltv_margin / ltv_rev if ltv_rev > 0 else 0
+    top_mpct = top_margin / top_rev if top_rev > 0 else 0
+
+    rows = [
+        {
+            "Metric": "Revenue",
+            "Standard": f"${std_rev:,.0f}",
+            "LTV Optimized": f"${ltv_rev:,.0f}",
+            "Top Line Optimized": f"${top_rev:,.0f}",
+        },
+        {
+            "Metric": "Margin",
+            "Standard": f"${std_margin:,.0f}",
+            "LTV Optimized": f"${ltv_margin:,.0f}",
+            "Top Line Optimized": f"${top_margin:,.0f}",
+        },
+        {
+            "Metric": "Margin %",
+            "Standard": f"{std_mpct:.1%}",
+            "LTV Optimized": f"{ltv_mpct:.1%}",
+            "Top Line Optimized": f"{top_mpct:.1%}",
+        },
+    ]
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 def render_per_deal_comparison(
     std: CohortScenario, ltv: CohortScenario, top: CohortScenario,
 ) -> None:
