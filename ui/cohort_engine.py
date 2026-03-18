@@ -1,0 +1,349 @@
+"""
+Cohort-level calculation engine.
+
+Takes per-deal financials from the revenue model, scales them by deal
+count, and produces side-by-side Standard vs LTV comparison data.
+
+The LTV scenario is built by taking standard pricing and using the
+multi-lever solver to find pricing adjustments that achieve the
+target win rate increase.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+from models.revenue_model import (
+    PricingScenario,
+    YearlyRevenue,
+    compute_three_year_financials,
+)
+from models.volume_forecast import VolumeForecastYear, forecast_volume_y1_y3
+from models.win_probability import (
+    win_probability,
+    win_probability_uncapped,
+    solve_multi_lever_for_target_win_rate,
+    optimize_topline_pricing,
+)
+import config as cfg
+
+
+@dataclass
+class CohortYearMetrics:
+    year: int
+    deals: int
+    saas_revenue: float
+    impl_fee_revenue: float
+    cc_revenue: float
+    ach_revenue: float
+    bank_revenue: float
+    float_income: float
+    teampay_saas_revenue: float
+    teampay_processing_revenue: float
+    teampay_cost: float
+    total_revenue: float
+    total_cost: float
+    margin: float
+    margin_pct: float
+    take_rate: float
+
+
+@dataclass
+class CohortScenario:
+    name: str
+    deals_won: int
+    win_rate: float
+    per_deal_pricing: PricingScenario
+    per_deal_yearly: dict[int, YearlyRevenue]
+    per_deal_volumes: dict[int, VolumeForecastYear]
+    cohort_yearly: dict[int, CohortYearMetrics]
+    three_year_revenue: float
+    three_year_margin: float
+    three_year_margin_pct: float
+    three_year_take_rate: float
+    lever_changes: dict | None = None
+
+
+def _retention_factor(year: int, quarterly_churn: float = 0.02) -> float:
+    """Average active deal fraction for a given year.
+
+    Models the average retention across the 4 quarters of each year.
+    Quarter retention = (1 - quarterly_churn)^q where q counts from deal close.
+    """
+    r = 1 - quarterly_churn
+    quarters_start = (year - 1) * 4
+    quarters_end = year * 4
+    avg = sum(r ** q for q in range(quarters_start, quarters_end)) / 4
+    return avg
+
+
+def _compute_teampay_year(
+    deals_won: int,
+    year: int,
+    retention: float,
+    tp_optin: float,
+    tp_usage: float,
+    proc_growth: float = 1.0,
+    monthly_volume: float = 50_000,
+    free_y1_saas: bool = True,
+) -> tuple[float, float, float]:
+    """Compute Teampay SaaS revenue, processing revenue, and cost for a year.
+
+    All Teampay customers retain (no Teampay-specific drop-off),
+    only regular cohort churn applies via retention.
+
+    If free_y1_saas=True (LTV/Top Line): Year 1 free SaaS, 50% processing ramp.
+    If free_y1_saas=False (Standard): Full SaaS and full volume from Year 1.
+
+    Returns (tp_saas_rev, tp_proc_rev, tp_cost).
+    """
+    active_tp = deals_won * tp_optin * tp_usage * retention
+
+    annual_proc_vol = monthly_volume * 12
+    vol_factor = 0.50 if (year == 1 and free_y1_saas) else 1.0
+    tp_proc_rev = active_tp * annual_proc_vol * cfg.TEAMPAY_PROCESSING_RATE * vol_factor * proc_growth
+    tp_proc_cost = tp_proc_rev * (1 - cfg.TEAMPAY_PROCESSING_MARGIN)
+
+    if year == 1 and free_y1_saas:
+        tp_saas_rev = 0.0
+        tp_saas_cost = 0.0
+    else:
+        tp_saas_rev = active_tp * cfg.TEAMPAY_SAAS_ANNUAL
+        tp_saas_cost = tp_saas_rev * (1 - cfg.TEAMPAY_SAAS_MARGIN)
+
+    return tp_saas_rev, tp_proc_rev, tp_proc_cost + tp_saas_cost
+
+
+def _scale_yearly(
+    yearly: dict[int, YearlyRevenue], deals: int,
+    quarterly_churn: float = 0.02,
+    tp_optin: float = 0.0,
+    tp_usage: float = 0.0,
+    tp_monthly_vol: float = 50_000,
+    tp_free_y1_saas: bool = True,
+) -> dict[int, CohortYearMetrics]:
+    """Multiply per-deal yearly financials by number of deals, adjusted for churn."""
+    g = cfg.TEAMPAY_PROCESSING_GROWTH
+    ret_y2 = _retention_factor(2, quarterly_churn)
+    ret_y3 = _retention_factor(3, quarterly_churn)
+    tp_growth = {
+        1: 1.0,
+        2: 1 + g,
+        3: (ret_y2 / ret_y3) * (1 + g) if ret_y3 > 0 else 1 + g,
+    }
+    proc_churn_offset = {1: 1.0, 2: 1.0, 3: 1.20}
+
+    result = {}
+    for y, yr in yearly.items():
+        retention = _retention_factor(y, quarterly_churn)
+        active = deals * retention
+        pco = proc_churn_offset.get(y, 1.0)
+        base_rev = yr.total_revenue * active
+        base_cost = yr.total_cost * active
+
+        tp_saas, tp_proc, tp_cost = _compute_teampay_year(
+            deals, y, retention, tp_optin, tp_usage, tp_growth.get(y, 1.0),
+            monthly_volume=tp_monthly_vol, free_y1_saas=tp_free_y1_saas,
+        )
+        tp_rev = tp_saas + tp_proc
+
+        cc_rev = yr.cc_revenue * active * pco
+        ach_rev = yr.ach_revenue * active * pco
+        bank_rev = yr.bank_network_revenue * active * pco
+        float_inc = yr.float_income * active * pco
+        proc_boost = (pco - 1.0) * (yr.cc_revenue + yr.ach_revenue + yr.bank_network_revenue + yr.float_income) * active
+
+        rev = base_rev + tp_rev + proc_boost
+        cost = base_cost + tp_cost
+        margin = rev - cost
+        mpct = margin / rev if rev > 0 else 0
+        vol = (yr.total_revenue / yr.take_rate * active) if yr.take_rate > 0 else 0
+        tr = rev / vol if vol > 0 else 0
+        result[y] = CohortYearMetrics(
+            year=y,
+            deals=int(round(active)),
+            saas_revenue=yr.saas_revenue * active,
+            impl_fee_revenue=yr.impl_fee_revenue * active,
+            cc_revenue=cc_rev,
+            ach_revenue=ach_rev,
+            bank_revenue=bank_rev,
+            float_income=float_inc,
+            teampay_saas_revenue=tp_saas,
+            teampay_processing_revenue=tp_proc,
+            teampay_cost=tp_cost,
+            total_revenue=rev,
+            total_cost=cost,
+            margin=margin,
+            margin_pct=mpct,
+            take_rate=tr,
+        )
+    return result
+
+
+def _build_cohort_scenario(
+    name: str,
+    deals_won: int,
+    win_rate: float,
+    pricing: PricingScenario,
+    per_deal_yearly: dict[int, YearlyRevenue],
+    per_deal_volumes: dict[int, VolumeForecastYear],
+    lever_changes: dict | None = None,
+    quarterly_churn: float = 0.02,
+    tp_optin: float = 0.0,
+    tp_usage: float = 0.0,
+    tp_monthly_vol: float = 50_000,
+    tp_free_y1_saas: bool = True,
+) -> CohortScenario:
+    cohort_yearly = _scale_yearly(
+        per_deal_yearly, deals_won, quarterly_churn,
+        tp_optin=tp_optin, tp_usage=tp_usage, tp_monthly_vol=tp_monthly_vol,
+        tp_free_y1_saas=tp_free_y1_saas,
+    )
+    total_rev = sum(cy.total_revenue for cy in cohort_yearly.values())
+    total_margin = sum(cy.margin for cy in cohort_yearly.values())
+    total_vol = sum(
+        cy.total_revenue / cy.take_rate
+        for cy in cohort_yearly.values() if cy.take_rate > 0
+    )
+    return CohortScenario(
+        name=name,
+        deals_won=deals_won,
+        win_rate=win_rate,
+        per_deal_pricing=pricing,
+        per_deal_yearly=per_deal_yearly,
+        per_deal_volumes=per_deal_volumes,
+        cohort_yearly=cohort_yearly,
+        three_year_revenue=total_rev,
+        three_year_margin=total_margin,
+        three_year_margin_pct=total_margin / total_rev if total_rev > 0 else 0,
+        three_year_take_rate=total_rev / total_vol if total_vol > 0 else 0,
+        lever_changes=lever_changes,
+    )
+
+
+def run_cohort_comparison(
+    deals_to_pricing: int,
+    current_win_rate: float,
+    avg_saas_arr: float,
+    avg_impl_fee: float,
+    total_arr_won: float,
+    standard_pricing_inputs: dict,
+    win_rate_increase: float,
+    quarterly_churn: float = 0.02,
+    tp_contract_optin: float = 0.50,
+    tp_actual_usage: float = 0.20,
+    tp_monthly_volume: float = 50_000,
+) -> tuple[CohortScenario, CohortScenario, CohortScenario, str]:
+    """
+    Run Standard, LTV-Optimized, and Top-Line-Optimized scenarios.
+
+    Returns (standard, ltv, topline, solver_message).
+    """
+    std_deals = int(round(deals_to_pricing * current_win_rate))
+    per_deal_arr = total_arr_won / std_deals if std_deals > 0 else 0.0
+
+    volumes = forecast_volume_y1_y3(per_deal_arr)
+
+    # --- Standard scenario ---
+    std_pricing = PricingScenario(
+        saas_arr_discount_pct=standard_pricing_inputs["saas_arr_discount_pct"],
+        impl_fee_discount_pct=standard_pricing_inputs["impl_fee_discount_pct"],
+        cc_base_rate=standard_pricing_inputs["cc_base_rate"],
+        cc_amex_rate=standard_pricing_inputs["cc_amex_rate"],
+        ach_accel_pct=standard_pricing_inputs["ach_accel_pct"],
+        ach_accel_bps=standard_pricing_inputs["ach_accel_bps"],
+        ach_fixed_fee=standard_pricing_inputs["ach_fixed_fee"],
+        hold_days_cc=standard_pricing_inputs["hold_days_cc"],
+        saas_arr_list=avg_saas_arr,
+        impl_fee_list=avg_impl_fee,
+    )
+    std_wp = win_probability(std_pricing)
+    std_yearly = compute_three_year_financials(volumes, std_pricing, include_float=True)
+
+    standard = _build_cohort_scenario(
+        "Standard Pricing", std_deals, current_win_rate,
+        std_pricing, std_yearly, volumes, quarterly_churn=quarterly_churn,
+        tp_optin=0.10, tp_usage=1.0,
+        tp_monthly_vol=tp_monthly_volume,
+        tp_free_y1_saas=False,
+    )
+
+    # --- Boosted scenario via solver ---
+    target_wp = min(current_win_rate + win_rate_increase, 0.80)
+    solver_msg = ""
+
+    if win_rate_increase <= 0:
+        return standard, standard, standard, "No win rate increase selected."
+
+    import copy
+    lb = cfg.LEVER_BOUNDS
+    solver_pricing = copy.copy(std_pricing)
+    solver_pricing.ach_accel_pct = max(lb["ach_accel_pct"]["min"],
+                                       min(lb["ach_accel_pct"]["max"], solver_pricing.ach_accel_pct))
+    solver_pricing.ach_accel_bps = max(lb["ach_accel_bps"]["min"],
+                                       min(lb["ach_accel_bps"]["max"], solver_pricing.ach_accel_bps))
+
+    result = solve_multi_lever_for_target_win_rate(
+        solver_pricing, target_wp, {},
+    )
+
+    if result is not None:
+        boosted_pricing = result["pricing"]
+        lever_changes = result["changes"]
+        boosted_wp = target_wp
+    else:
+        maxed = copy.copy(solver_pricing)
+        lever_changes = {}
+
+        maxed.saas_arr_discount_pct = lb["saas_arr_discount_pct"]["max"]
+        maxed.cc_base_rate = lb["cc_base_rate"]["min"]
+        maxed.cc_amex_rate = lb["cc_amex_rate"]["min"]
+        maxed.hold_days_cc = lb["hold_days_cc"]["max"]
+        maxed.impl_fee_discount_pct = lb["impl_fee_discount_pct"]["max"]
+        maxed.ach_accel_pct = lb["ach_accel_pct"]["min"]
+        maxed.ach_accel_bps = lb["ach_accel_bps"]["min"]
+        maxed.ach_fixed_fee = lb["ach_fixed_fee"]["default"]
+
+        for attr in ("saas_arr_discount_pct", "cc_base_rate", "cc_amex_rate",
+                      "hold_days_cc", "impl_fee_discount_pct",
+                      "ach_accel_pct", "ach_accel_bps", "ach_fixed_fee"):
+            old_val = getattr(std_pricing, attr)
+            new_val = getattr(maxed, attr)
+            if old_val != new_val:
+                lever_changes[attr] = (old_val, new_val)
+
+        max_wp = win_probability_uncapped(maxed)
+        max_boost = max_wp - current_win_rate
+        boosted_pricing = maxed
+        boosted_wp = current_win_rate + max(max_boost, 0)
+        solver_msg = (
+            f"Target +{win_rate_increase:.0%} not fully reachable. "
+            f"Showing max achievable: +{max_boost:.1%}"
+        )
+
+    boosted_yearly = compute_three_year_financials(volumes, boosted_pricing, include_float=True)
+    boosted_deals = int(round(deals_to_pricing * boosted_wp))
+
+    boosted = _build_cohort_scenario(
+        "LTV Optimized", boosted_deals, boosted_wp,
+        boosted_pricing, boosted_yearly, volumes, lever_changes,
+        quarterly_churn=quarterly_churn,
+        tp_optin=tp_contract_optin, tp_usage=tp_actual_usage,
+        tp_monthly_vol=tp_monthly_volume,
+    )
+
+    # --- Top Line Optimized: maximize 3-year cohort revenue ---
+    top_pricing, top_changes, top_wp = optimize_topline_pricing(
+        solver_pricing, deals_to_pricing, volumes, quarterly_churn,
+    )
+
+    top_yearly = compute_three_year_financials(volumes, top_pricing, include_float=True)
+    top_deals = int(round(deals_to_pricing * top_wp))
+
+    topline = _build_cohort_scenario(
+        "Top Line Optimized", top_deals, top_wp,
+        top_pricing, top_yearly, volumes, top_changes,
+        quarterly_churn=quarterly_churn,
+        tp_optin=tp_contract_optin, tp_usage=tp_actual_usage,
+        tp_monthly_vol=tp_monthly_volume,
+    )
+
+    return standard, boosted, topline, solver_msg
