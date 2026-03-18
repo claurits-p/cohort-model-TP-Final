@@ -80,10 +80,13 @@ def _linear_impact(
 def _ach_win_impact(pricing: PricingScenario) -> float:
     """ACH win rate impact from the blended model.
 
-    Two components:
+    Three components:
     1. Accelerated bps penalty: charging high bps hurts. 0.35% is slight,
-       0.49% is significant. Scaled by accel_pct (30% at 0.35% ≈ neutral).
-    2. Fixed fee impact: $2.50-$4.00 = neutral, above $4 starts hurting.
+       0.49% is significant. Scaled by accel_pct.
+    2. Accelerated reduction benefit: moving customers off accelerated
+       gives a small win rate boost.
+    3. Fixed fee penalty: $1.00-$2.50 neutral. Above $2.50 adds linear
+       friction; $5.00 is very hard to pull off at portfolio level.
     """
     lb = cfg.LEVER_BOUNDS
     max_ach_impact = _IMPACTS["ach_rate"]
@@ -93,7 +96,6 @@ def _ach_win_impact(pricing: PricingScenario) -> float:
     fixed_fee = pricing.ach_fixed_fee
     std_accel_pct = _STD["ach_accel_pct"]
     std_accel_bps = _STD["ach_accel_bps"]
-    std_fixed_fee = _STD["ach_fixed_fee"]
 
     bps_penalty = 0.0
     if accel_bps > std_accel_bps:
@@ -107,12 +109,13 @@ def _ach_win_impact(pricing: PricingScenario) -> float:
         accel_benefit = max_ach_impact * 0.3 * (std_accel_pct - accel_pct)
 
     fee_penalty = 0.0
-    fee_neutral_max = 4.00
+    fee_neutral_max = 2.50
+    fee_hard_cap = 5.00
     if fixed_fee > fee_neutral_max:
-        fee_range = lb["ach_fixed_fee"]["max"] - fee_neutral_max
+        fee_range = fee_hard_cap - fee_neutral_max
         if fee_range > 0:
             fee_severity = min(1.0, (fixed_fee - fee_neutral_max) / fee_range)
-            fee_penalty = -max_ach_impact * 0.3 * fee_severity * (1 - accel_pct)
+            fee_penalty = -max_ach_impact * fee_severity * (1 - accel_pct)
 
     return bps_penalty + accel_benefit + fee_penalty
 
